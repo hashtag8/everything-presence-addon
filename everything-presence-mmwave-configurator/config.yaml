@@ -1,4 +1,4 @@
-name: "Presence Zone Configurator"
+name: "Everything Presence Zone Configurator"
 description: "Helps you to visually create zones for a mmWave Presence Sensor for Home Assistant"
 version: "1.1.1"
 slug: "everything-presence-zone-configurator"
