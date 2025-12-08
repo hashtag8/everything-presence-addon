@@ -55,6 +55,14 @@ export interface DeviceMapping {
   unmappedEntities: string[];
   /** Unit of measurement for specific entities (e.g., "target1X" -> "in" or "mm") */
   entityUnits?: Record<string, string>;
+  /** Device firmware version (e.g., "1.4.1") - parsed from sw_version */
+  firmwareVersion?: string;
+  /** ESPHome version the device is running (e.g., "2025.11.2") - parsed from sw_version */
+  esphomeVersion?: string;
+  /** Raw sw_version string from Home Assistant (e.g., "1.4.1 (ESPHome 2025.11.2)") */
+  rawSwVersion?: string;
+  /** Schema version from device profile at time of last sync (e.g., "1.0") */
+  profileSchemaVersion?: string;
 }
 
 /**
@@ -295,13 +303,11 @@ export const getMigrationPreview = async (): Promise<MigrationResponse | null> =
 };
 
 /**
- * Check if a device has valid mappings.
+ * Check if a device has mappings stored.
+ * Note: Callers should compare profileSchemaVersion with profile.schemaVersion
+ * to determine if resync is needed.
  */
 export const hasValidMappings = async (deviceId: string): Promise<boolean> => {
   const mapping = await getDeviceMapping(deviceId);
-  if (!mapping) {
-    return false;
-  }
-  // Must have at least the presence entity
-  return !!(mapping.mappings.presence || mapping.mappings.presenceEntity);
+  return mapping !== null;
 };
