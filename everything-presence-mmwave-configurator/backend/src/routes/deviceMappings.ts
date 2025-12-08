@@ -1,12 +1,15 @@
 import { Router } from 'express';
-import { deviceMappingStorage, DeviceMapping } from '../config/deviceMappingStorage';
+import { deviceMappingStorage, DeviceMapping, parseFirmwareVersion } from '../config/deviceMappingStorage';
 import { deviceEntityService } from '../domain/deviceEntityService';
 import { migrationService } from '../domain/migrationService';
 import { logger } from '../logger';
 import type { IHaReadTransport } from '../ha/readTransport';
+import { normalizeMappingKeys } from '../domain/mappingUtils';
+import type { DeviceProfileLoader } from '../domain/deviceProfiles';
 
 export interface DeviceMappingsRouterDependencies {
   readTransport?: IHaReadTransport;
+  profileLoader?: DeviceProfileLoader;
 }
 
 /**
@@ -16,6 +19,7 @@ export interface DeviceMappingsRouterDependencies {
 export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependencies): Router => {
   const router = Router();
   const readTransport = deps?.readTransport;
+  const profileLoader = deps?.profileLoader;
 
   /**
    * GET /api/device-mappings
@@ -70,12 +74,58 @@ export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependenci
       // Get existing mapping if it exists
       const existing = deviceMappingStorage.getMapping(deviceId);
 
+      // Normalize mappings to ensure key compatibility across callers
+      const normalizedMappings = normalizeMappingKeys(mappingData.mappings ?? existing?.mappings ?? {});
+      if (existing?.mappings) {
+        for (const [key, value] of Object.entries(normalizedMappings)) {
+          const previous = existing.mappings[key];
+          if (previous && previous !== value) {
+            logger.info({ deviceId, key, from: previous, to: value }, 'Mapping overwrite attempt');
+          }
+        }
+      }
+
       // Fetch entity units if readTransport is available and mappings are provided
       let entityUnits: Record<string, string> = mappingData.entityUnits ?? existing?.entityUnits ?? {};
 
-      // If we have new mappings and readTransport is available, fetch units for coordinate entities
-      if (mappingData.mappings && readTransport && Object.keys(entityUnits).length === 0) {
-        entityUnits = await fetchEntityUnits(mappingData.mappings, readTransport);
+      // If we have new mappings and readTransport is available, fetch/refresh units
+      // Always refetch during resync to capture any newly added keys
+      if (mappingData.mappings && readTransport) {
+        const freshUnits = await fetchEntityUnits(normalizedMappings, readTransport);
+        // Merge fresh units with existing, preferring fresh values
+        entityUnits = { ...entityUnits, ...freshUnits };
+      }
+
+      // Fetch firmware version if not provided and not already stored
+      let firmwareVersion = mappingData.firmwareVersion ?? existing?.firmwareVersion;
+      let esphomeVersion = mappingData.esphomeVersion ?? existing?.esphomeVersion;
+      let rawSwVersion = mappingData.rawSwVersion ?? existing?.rawSwVersion;
+
+      // If we don't have firmware info yet and readTransport is available, fetch it
+      if (!firmwareVersion && !rawSwVersion && readTransport) {
+        try {
+          const devices = await readTransport.listDevices();
+          const device = devices.find(d => d.id === deviceId);
+          if (device?.sw_version) {
+            rawSwVersion = device.sw_version;
+            const parsed = parseFirmwareVersion(device.sw_version);
+            firmwareVersion = parsed.firmwareVersion;
+            esphomeVersion = parsed.esphomeVersion;
+            logger.debug({ deviceId, rawSwVersion, firmwareVersion, esphomeVersion }, 'Fetched firmware version during PUT');
+          }
+        } catch (err) {
+          logger.warn({ err, deviceId }, 'Failed to fetch device firmware version during PUT, continuing without it');
+        }
+      }
+
+      // Get current profile schema version for resync detection
+      const profileId = mappingData.profileId ?? existing?.profileId;
+      let profileSchemaVersion = mappingData.profileSchemaVersion ?? existing?.profileSchemaVersion;
+      if (profileId && profileLoader) {
+        const profile = profileLoader.getProfileById(profileId);
+        if (profile?.schemaVersion) {
+          profileSchemaVersion = profile.schemaVersion;
+        }
       }
 
       // Build the mapping object
@@ -88,9 +138,13 @@ export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependenci
         confirmedByUser: mappingData.confirmedByUser ?? existing?.confirmedByUser ?? true,
         autoMatchedCount: mappingData.autoMatchedCount ?? existing?.autoMatchedCount ?? 0,
         manuallyMappedCount: mappingData.manuallyMappedCount ?? existing?.manuallyMappedCount ?? 0,
-        mappings: mappingData.mappings ?? existing?.mappings ?? {},
+        mappings: normalizedMappings,
         unmappedEntities: mappingData.unmappedEntities ?? existing?.unmappedEntities ?? [],
         entityUnits,
+        firmwareVersion,
+        esphomeVersion,
+        rawSwVersion,
+        profileSchemaVersion,
       };
 
       await deviceMappingStorage.saveMapping(mapping);
@@ -263,8 +317,9 @@ export const createDeviceMappingsRouter = (deps?: DeviceMappingsRouterDependenci
 };
 
 /**
- * Fetch unit_of_measurement from Home Assistant for tracking coordinate entities.
- * This is needed to handle imperial unit conversion (inches -> mm).
+ * Fetch unit_of_measurement from Home Assistant for all mapped entities.
+ * This captures units for any entity that has one (sensors, number inputs, etc.)
+ * to support imperial/metric display throughout the UI.
  */
 async function fetchEntityUnits(
   flatMappings: Record<string, string>,
@@ -272,19 +327,14 @@ async function fetchEntityUnits(
 ): Promise<Record<string, string>> {
   const entityUnits: Record<string, string> = {};
 
-  // Keys that represent coordinate/distance measurements needing unit conversion
-  const coordinateKeys = [
-    'target1X', 'target1Y', 'target2X', 'target2Y', 'target3X', 'target3Y',
-    'target1Distance', 'target2Distance', 'target3Distance',
-    'distance', 'maxDistance',
-  ];
-
+  // Build list of all unique entity IDs to fetch
   const entityIdsToFetch: Array<{ key: string; entityId: string }> = [];
+  const seenEntityIds = new Set<string>();
 
-  for (const key of coordinateKeys) {
-    const entityId = flatMappings[key];
-    if (entityId) {
+  for (const [key, entityId] of Object.entries(flatMappings)) {
+    if (entityId && !seenEntityIds.has(entityId)) {
       entityIdsToFetch.push({ key, entityId });
+      seenEntityIds.add(entityId);
     }
   }
 
@@ -304,6 +354,8 @@ async function fetchEntityUnits(
         logger.debug({ key, entityId, unit }, 'Captured entity unit of measurement');
       }
     }
+
+    logger.info({ count: Object.keys(entityUnits).length, total: entityIdsToFetch.length }, 'Fetched entity units');
   } catch (err) {
     logger.warn({ err }, 'Failed to fetch entity units - proceeding without unit metadata');
   }
