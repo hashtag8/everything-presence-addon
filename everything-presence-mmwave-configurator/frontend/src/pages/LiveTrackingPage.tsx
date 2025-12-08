@@ -119,9 +119,21 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   // useDeviceMapping triggers loading the mapping into cache, useDeviceMappings provides the check
   const { hasValidMappings } = useDeviceMappings();
   const { mapping: deviceMapping, loading: mappingLoading } = useDeviceMapping(selectedRoom?.deviceId);
-  // Check validity: mapping must be loaded AND have presence entity
-  const deviceHasValidMappings = !mappingLoading && deviceMapping !== null &&
-    !!(deviceMapping.mappings.presence || deviceMapping.mappings.presenceEntity);
+  // Check validity: mapping must be loaded AND schema versions must match
+  // If profile has a schemaVersion, the mapping must have a matching profileSchemaVersion
+  // This ensures users are prompted to resync when profile schema changes
+  const deviceHasValidMappings = useMemo(() => {
+    if (mappingLoading || deviceMapping === null) return false;
+    // If the profile has a schema version, check if mapping version matches
+    const profileSchemaVersion = selectedProfile?.schemaVersion;
+    const mappingSchemaVersion = deviceMapping.profileSchemaVersion;
+    // If profile has a version but mapping doesn't, needs resync (backward compat)
+    if (profileSchemaVersion && !mappingSchemaVersion) return false;
+    // If both have versions, they must match
+    if (profileSchemaVersion && mappingSchemaVersion && profileSchemaVersion !== mappingSchemaVersion) return false;
+    // Mapping is valid
+    return true;
+  }, [mappingLoading, deviceMapping, selectedProfile?.schemaVersion]);
 
   // Derive entityNamePrefix for heatmap
   const entityNamePrefix = useMemo(() => {
@@ -1166,14 +1178,14 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 {liveState.illuminance !== null && liveState.illuminance !== undefined && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">Light:</span>
-                    <span className="text-slate-200">{liveState.illuminance.toFixed(1)} lx</span>
+                    <span className="text-slate-200">{liveState.illuminance.toFixed(1)} {deviceMapping?.entityUnits?.illuminance || 'lx'}</span>
                   </div>
                 )}
 
                 {liveState.temperature !== null && liveState.temperature !== undefined && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">Temperature:</span>
-                    <span className="text-slate-200">{liveState.temperature.toFixed(1)}°C</span>
+                    <span className="text-slate-200">{liveState.temperature.toFixed(1)}{deviceMapping?.entityUnits?.temperature || '°C'}</span>
                   </div>
                 )}
 
@@ -1187,7 +1199,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       liveState.co2 < 2000 ? 'text-orange-400' :
                       'text-rose-400'
                     }>
-                      {Math.round(liveState.co2)} ppm
+                      {Math.round(liveState.co2)} {deviceMapping?.entityUnits?.co2 || 'ppm'}
                     </span>
                   </div>
                 )}
@@ -1461,7 +1473,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       'text-rose-400'
                     }`}>
                       {Math.round(liveState.co2)}
-                      <span className="text-base font-normal text-slate-400 ml-1">ppm</span>
+                      <span className="text-base font-normal text-slate-400 ml-1">{deviceMapping?.entityUnits?.co2 || 'ppm'}</span>
                     </div>
                     <div className={`text-xs font-medium mt-1 ${
                       liveState.co2 < 800 ? 'text-emerald-300' :
@@ -1526,6 +1538,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 temperature={liveState.temperature ?? null}
                 presence={liveState.presence ?? false}
                 distance={liveState.distance ?? null}
+                entityUnits={deviceMapping?.entityUnits}
               />
             )}
 
@@ -1544,6 +1557,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 deviceId={selectedRoom.deviceId || selectedRoomId || 'unknown'}
                 presence={liveState.presence ?? false}
                 temperature={liveState.temperature ?? null}
+                entityUnits={deviceMapping?.entityUnits}
               />
             )}
 
