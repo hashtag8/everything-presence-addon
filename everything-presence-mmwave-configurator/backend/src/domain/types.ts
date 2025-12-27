@@ -121,7 +121,16 @@ export interface EntityMappings {
   modeEntity?: string;
 
   // Configuration entities
+  distanceMinEntity?: string;
   maxDistanceEntity?: string;
+  triggerDistanceEntity?: string;
+  sensitivityEntity?: string;
+  triggerSensitivityEntity?: string;
+  offLatencyEntity?: string;
+  onLatencyEntity?: string;
+  thresholdFactorEntity?: string;
+  microMotionEntity?: string;
+  updateRateEntity?: string;
   installationAngleEntity?: string;
   polygonZonesEnabledEntity?: string;
 
@@ -207,6 +216,7 @@ export interface AppSettings {
   outlineDone?: boolean;
   placementDone?: boolean;
   zonesReady?: boolean;
+  defaultRoomId?: string | null;
 }
 
 // Custom floor material added by user
