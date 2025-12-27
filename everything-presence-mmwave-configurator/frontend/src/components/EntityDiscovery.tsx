@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { EntityMappings } from '../api/types';
 import {
   discoverEntities,
@@ -11,6 +11,7 @@ import {
 } from '../api/entityDiscovery';
 import { saveDeviceMapping, DeviceMapping } from '../api/deviceMappings';
 import { useDeviceMappings } from '../contexts/DeviceMappingsContext';
+import { validateMappings } from '../api/entityDiscovery';
 
 interface EntityDiscoveryProps {
   deviceId: string;
@@ -31,26 +32,48 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
   onCancel,
   onBack,
 }) => {
-  const { refreshMapping } = useDeviceMappings();
+  const { getMapping, refreshMapping } = useDeviceMappings();
+  const [existingMapping, setExistingMapping] = useState<DeviceMapping | null>(null);
   const [status, setStatus] = useState<DiscoveryStatus>('loading');
   const [saving, setSaving] = useState(false);
   const [discoveryResult, setDiscoveryResult] = useState<DiscoveryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [validationErrors, setValidationErrors] = useState<string | null>(null);
   const [manualOverrides, setManualOverrides] = useState<Record<string, string>>({});
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [allEntities, setAllEntities] = useState<EntityRegistryEntry[]>([]);
+  const entityById = useMemo(() => {
+    return new Map(allEntities.map((entity) => [entity.entity_id, entity]));
+  }, [allEntities]);
+
+  // Load existing device mapping to preserve user overrides during re-sync
+  useEffect(() => {
+    const loadExistingMapping = async () => {
+      try {
+        const mapping = await getMapping(deviceId);
+        setExistingMapping(mapping);
+      } catch {
+        setExistingMapping(null);
+      }
+    };
+    loadExistingMapping();
+  }, [deviceId, getMapping]);
 
   const runDiscovery = useCallback(async () => {
     setStatus('loading');
     setError(null);
+    setValidationErrors(null);
+    setManualOverrides({});
 
     try {
       const result = await discoverEntities(deviceId, profileId);
       setDiscoveryResult(result);
       setAllEntities(result.deviceEntities);
 
+      const conflictCount = result.results.filter((r) => r.matchConfidence === 'conflict').length;
+
       if (result.allMatched) {
-        setStatus('success');
+        setStatus(conflictCount > 0 ? 'partial' : 'success');
       } else {
         setStatus('partial');
         // Auto-expand groups with unmatched entities
@@ -62,6 +85,23 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
           }
         }
         setExpandedGroups(groupsWithUnmatched);
+      }
+
+      // Seed manual overrides from existing mapping so user-set values persist on re-sync
+      if (existingMapping) {
+        const overrides: Record<string, string> = {};
+        for (const match of result.results) {
+          const key = match.templateKey;
+          const m = existingMapping.mappings;
+          const direct = m[key];
+          const withEntitySuffix = m[`${key}Entity`];
+          const withoutEntitySuffix = key.endsWith('Entity') ? m[key.replace(/Entity$/, '')] : undefined;
+          const chosen = direct || withEntitySuffix || withoutEntitySuffix;
+          if (chosen) {
+            overrides[key] = chosen;
+          }
+        }
+        setManualOverrides(overrides);
       }
     } catch (err) {
       setError((err as Error).message);
@@ -82,6 +122,7 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
   }, [runDiscovery]);
 
   const handleOverride = (templateKey: string, entityId: string) => {
+    setValidationErrors(null);
     setManualOverrides((prev) => ({
       ...prev,
       [templateKey]: entityId,
@@ -142,8 +183,24 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
 
   const handleContinue = async () => {
     setSaving(true);
+    setValidationErrors(null);
     try {
       const mappings = buildFinalMappings();
+
+      // Validate mappings against HA before saving/continuing
+      try {
+        const validation = await validateMappings(deviceId, mappings);
+        if (!validation.valid) {
+          const summary = validation.errors.slice(0, 5).map((e) => `${e.key} (${e.entityId}): ${e.error}`).join('; ');
+          setValidationErrors(`Validation failed for ${validation.errors.length} entr${validation.errors.length === 1 ? 'y' : 'ies'}: ${summary}`);
+          setSaving(false);
+          return;
+        }
+      } catch (err) {
+        setValidationErrors(`Validation failed: ${(err as Error).message}`);
+        setSaving(false);
+        return;
+      }
 
       // Convert EntityMappings to flat DeviceMapping format for storage
       const flatMappings: Record<string, string> = {};
@@ -298,10 +355,9 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
       onComplete(mappings);
     } catch (err) {
       console.error('Failed to save device mapping:', err);
-      // Still continue with the flow even if saving fails
-      // The legacy room.entityMappings will be used as fallback
-      const mappings = buildFinalMappings();
-      onComplete(mappings);
+      setError(err instanceof Error ? err.message : 'Failed to save device mapping');
+      setSaving(false);
+      return;
     } finally {
       setSaving(false);
     }
@@ -323,6 +379,8 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
     switch (confidence) {
       case 'exact':
         return '✓';
+      case 'conflict':
+        return '!';
       case 'suffix':
       case 'name':
         return '~';
@@ -335,6 +393,8 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
     switch (confidence) {
       case 'exact':
         return 'text-green-400';
+      case 'conflict':
+        return 'text-orange-400';
       case 'suffix':
       case 'name':
         return 'text-yellow-400';
@@ -347,12 +407,49 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
     const effectiveEntityId = manualOverrides[result.templateKey] || result.matchedEntityId;
     const isOverridden = !!manualOverrides[result.templateKey];
     const isMatched = !!effectiveEntityId;
+    const needsReview = result.matchConfidence === 'conflict' || (!result.matchedEntityId && !result.isOptional);
+    const matchedEntity = effectiveEntityId ? entityById.get(effectiveEntityId) : undefined;
+    const isDisabled = !!matchedEntity?.disabled_by;
+
+    const renderOptionLabel = (entityId: string) => {
+      const entity = entityById.get(entityId);
+      const name = entity?.name ? ` (${entity.name})` : '';
+      const disabled = entity?.disabled_by ? ' [disabled]' : entity?.hidden_by ? ' [hidden]' : '';
+      return `${entityId}${name}${disabled}`;
+    };
+
+    const buildOptions = (): string[] => {
+      const options: string[] = [];
+      const seen = new Set<string>();
+
+      if (effectiveEntityId) {
+        options.push(effectiveEntityId);
+        seen.add(effectiveEntityId);
+      }
+      if (result.matchedEntityId && !seen.has(result.matchedEntityId)) {
+        options.push(result.matchedEntityId);
+        seen.add(result.matchedEntityId);
+      }
+
+      const source = result.candidates.length > 0 ? result.candidates : allEntities.map((e) => e.entity_id);
+      for (const entityId of source) {
+        if (seen.has(entityId)) continue;
+        seen.add(entityId);
+        options.push(entityId);
+      }
+
+      return options;
+    };
 
     return (
       <div
         key={result.templateKey}
         className={`flex items-center justify-between py-2 px-3 rounded-lg ${
-          isMatched ? 'bg-slate-800/30' : 'bg-red-500/10 border border-red-500/30'
+          isMatched
+            ? needsReview
+              ? 'bg-orange-500/10 border border-orange-500/30'
+              : 'bg-slate-800/30'
+            : 'bg-red-500/10 border border-red-500/30'
         }`}
       >
         <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -365,39 +462,43 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
           {result.isOptional && (
             <span className="text-xs text-slate-500">(optional)</span>
           )}
+          {needsReview && (
+            <span className="text-xs text-orange-300 ml-2">Review</span>
+          )}
         </div>
 
         <div className="flex items-center gap-2 ml-2">
           {isMatched && !isOverridden ? (
-            <span className="text-xs text-slate-400 font-mono truncate max-w-[200px]">
+            <span
+              className="text-xs text-slate-400 font-mono break-all max-w-[360px]"
+              title={effectiveEntityId || undefined}
+            >
               {effectiveEntityId}
             </span>
           ) : (
             <select
               value={effectiveEntityId || ''}
               onChange={(e) => handleOverride(result.templateKey, e.target.value)}
-              className="text-xs bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-300 max-w-[200px]"
+              className="text-xs bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-300 max-w-[320px]"
             >
               <option value="">Select entity...</option>
-              {result.candidates.length > 0 ? (
-                result.candidates.map((candidate) => (
-                  <option key={candidate} value={candidate}>
-                    {candidate}
-                  </option>
-                ))
-              ) : (
-                allEntities.map((entity) => (
-                  <option key={entity.entity_id} value={entity.entity_id}>
-                    {entity.entity_id}
-                  </option>
-                ))
-              )}
+              {buildOptions().map((candidate) => (
+                <option key={candidate} value={candidate}>
+                  {renderOptionLabel(candidate)}
+                </option>
+              ))}
             </select>
+          )}
+
+          {isMatched && isDisabled && (
+            <span className="text-xs text-amber-300 border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 rounded">
+              Disabled in HA
+            </span>
           )}
 
           {isMatched && !isOverridden && (
             <button
-              onClick={() => handleOverride(result.templateKey, '')}
+              onClick={() => handleOverride(result.templateKey, result.matchedEntityId || '')}
               className="text-xs text-slate-500 hover:text-slate-300"
               title="Change entity"
             >
@@ -421,6 +522,15 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
           const totalRequired = results.filter((r) => !r.isOptional).length;
           const isExpanded = expandedGroups.has(groupName);
           const hasUnmatched = results.some((r) => !r.matchedEntityId && !r.isOptional && !manualOverrides[r.templateKey]);
+          const disabledCount = results.reduce((count, r) => {
+            const entityId = manualOverrides[r.templateKey] || r.matchedEntityId;
+            if (!entityId) return count;
+            const entity = entityById.get(entityId);
+            if (entity?.disabled_by) {
+              return count + 1;
+            }
+            return count;
+          }, 0);
 
           return (
             <div key={groupName} className="border border-slate-700 rounded-lg overflow-hidden">
@@ -440,6 +550,11 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
                   <span className="text-xs text-slate-400">
                     {matchedCount}/{results.length} matched
                   </span>
+                  {disabledCount > 0 && (
+                    <span className="text-xs text-amber-200 border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 rounded">
+                      Disabled: {disabledCount}
+                    </span>
+                  )}
                   <span className="text-slate-500">{isExpanded ? '▼' : '▶'}</span>
                 </div>
               </button>
@@ -462,6 +577,19 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
     : 0;
   const totalEntities = discoveryResult?.results.length || 0;
   const percentage = totalEntities > 0 ? Math.round((totalMatched / totalEntities) * 100) : 0;
+  const disabledMatchedCount = useMemo(() => {
+    if (!discoveryResult) return 0;
+    let count = 0;
+    for (const result of discoveryResult.results) {
+      const entityId = manualOverrides[result.templateKey] || result.matchedEntityId;
+      if (!entityId) continue;
+      const entity = entityById.get(entityId);
+      if (entity?.disabled_by) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [discoveryResult, manualOverrides, entityById]);
 
   return (
     <div className="h-full flex flex-col bg-slate-900">
@@ -538,7 +666,38 @@ export const EntityDiscovery: React.FC<EntityDiscoveryProps> = ({
                   style={{ width: `${percentage}%` }}
                 />
               </div>
+
+              {validationErrors && (
+                <div className="mt-3 p-3 rounded-lg border border-red-500/40 bg-red-500/10 text-sm text-red-300">
+                  {validationErrors}
+                </div>
+              )}
+              {disabledMatchedCount > 0 && (
+                <div className="mt-3 p-3 rounded-lg border border-amber-500/40 bg-amber-500/10 text-sm text-amber-200">
+                  {disabledMatchedCount} matched entr{disabledMatchedCount === 1 ? 'y is' : 'ies are'} disabled in Home Assistant.
+                  Enable {disabledMatchedCount === 1 ? 'it' : 'them'} in HA and everything should work without re-syncing.
+                </div>
+              )}
+              {error && status !== 'error' && (
+                <div className="mt-3 p-3 rounded-lg border border-red-500/40 bg-red-500/10 text-sm text-red-300">
+                  {error}
+                </div>
+              )}
             </div>
+
+            {/* Conflict / review hint */}
+            {discoveryResult && (
+              <div className="text-sm text-slate-400">
+                {discoveryResult.results.filter((r) => r.matchConfidence === 'conflict').length > 0 && (
+                  <p className="text-orange-300">
+                    Review needed: {discoveryResult.results.filter((r) => r.matchConfidence === 'conflict').length} conflicted entries.
+                  </p>
+                )}
+                {discoveryResult.results.filter((r) => !r.matchedEntityId && !r.isOptional).length > 0 && (
+                  <p>Unmatched required: {discoveryResult.results.filter((r) => !r.matchedEntityId && !r.isOptional).length}</p>
+                )}
+              </div>
+            )}
 
             {/* Entity groups */}
             {renderGroupedResults()}
