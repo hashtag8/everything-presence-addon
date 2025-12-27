@@ -23,6 +23,9 @@ export interface SettingEntity {
   unit?: string;
   options?: string[];
   description?: string;
+  disabledBy?: 'user' | 'integration' | 'config_entry' | null;
+  hiddenBy?: string | null;
+  status?: 'enabled' | 'disabled' | 'unavailable' | 'unknown';
 }
 
 export interface SettingsGroup {
@@ -373,6 +376,8 @@ class DeviceEntityServiceImpl {
           if (!groups[group]) {
             groups[group] = [];
           }
+          // Use entityUnits from device mapping if available, otherwise fall back to profile unit
+          const unit = mapping.entityUnits?.[key] || def.unit;
           groups[group].push({
             key,
             entityId: mapping.mappings[key],
@@ -381,7 +386,7 @@ class DeviceEntityServiceImpl {
             min: def.min,
             max: def.max,
             step: def.step,
-            unit: def.unit,
+            unit,
             options: def.options,
             description: def.description,
           });
