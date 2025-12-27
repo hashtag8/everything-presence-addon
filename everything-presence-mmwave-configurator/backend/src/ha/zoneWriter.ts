@@ -17,11 +17,86 @@ interface ZoneEntityMap {
   [zoneKey: string]: ZoneEntityConfig;
 }
 
+interface ZoneWriteTask {
+  execute: () => Promise<unknown>;
+  description: string;
+  entityId?: string;
+}
+
+export interface ZoneWriteFailure {
+  entityId?: string;
+  description: string;
+  error: string;
+}
+
+export interface ZoneWriteResult {
+  ok: boolean;
+  failures: ZoneWriteFailure[];
+}
+
 export class ZoneWriter {
   private readonly writeClient: IHaWriteClient;
 
   constructor(writeClient: IHaWriteClient) {
     this.writeClient = writeClient;
+  }
+
+  /**
+   * Execute tasks sequentially with retry logic and delays.
+   * This helps with opening too many requests to HA all at once
+   */
+  private async executeTasksSequentially(
+    tasks: ZoneWriteTask[],
+    options: { delayMs?: number; maxRetries?: number; continueOnError?: boolean } = {}
+  ): Promise<ZoneWriteFailure[]> {
+    const { delayMs = 50, maxRetries = 2, continueOnError = true } = options;
+    const failures: ZoneWriteFailure[] = [];
+
+    for (const task of tasks) {
+      let lastError: Error | null = null;
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          await task.execute();
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (attempt < maxRetries) {
+            logger.warn({ description: task.description, attempt: attempt + 1, maxRetries }, 'Task failed, retrying...');
+            // Exponential backoff: 100ms, 200ms, 400ms...
+            await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, attempt)));
+          }
+        }
+      }
+
+      if (lastError) {
+        logger.error({ description: task.description, error: lastError.message }, 'Task failed after retries');
+        failures.push({
+          entityId: task.entityId,
+          description: task.description,
+          error: lastError.message,
+        });
+        if (!continueOnError) {
+          throw lastError;
+        }
+      }
+
+      // Small delay between successful tasks to prevent overwhelming the device
+      if (delayMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+
+    return failures;
+  }
+
+  /**
+   * Extract zone index from zone ID (e.g., "Zone 3" -> 3, "Entry 1" -> 1)
+   */
+  private extractZoneIndex(id: string): number {
+    const match = id.match(/\d+$/);
+    return match ? parseInt(match[0], 10) : 0;
   }
 
   /**
@@ -38,8 +113,8 @@ export class ZoneWriter {
     entityNamePrefix: string,
     entityMappings?: EntityMappings,
     deviceId?: string
-  ): Promise<void> {
-    const tasks: Promise<unknown>[] = [];
+  ): Promise<ZoneWriteResult> {
+    const tasks: ZoneWriteTask[] = [];
 
     logger.debug({ entityNamePrefix, deviceId, zoneCount: zones.length, hasMappings: !!entityMappings }, 'Applying polygon zones');
 
@@ -65,7 +140,11 @@ export class ZoneWriter {
         if (entityId) {
           const textValue = polygonToText(zone.vertices);
           logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting polygon zone');
-          tasks.push(this.writeClient.setTextEntity(entityId, textValue));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, textValue),
+            description: `polygon zone ${idx + 1}`,
+            entityId,
+          });
         }
       });
 
@@ -75,7 +154,11 @@ export class ZoneWriter {
         const key = `zone${i + 1}`;
         const entityId = resolvePolygon('polygon', i + 1, 'polygonZoneEntities', key, polyMap[key]);
         if (entityId) {
-          tasks.push(this.writeClient.setTextEntity(entityId, ''));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, ''),
+            description: `clear polygon zone ${i + 1}`,
+            entityId,
+          });
         }
       }
     }
@@ -89,7 +172,11 @@ export class ZoneWriter {
         if (entityId) {
           const textValue = polygonToText(zone.vertices);
           logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting exclusion polygon');
-          tasks.push(this.writeClient.setTextEntity(entityId, textValue));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, textValue),
+            description: `exclusion polygon ${idx + 1}`,
+            entityId,
+          });
         }
       });
 
@@ -98,7 +185,11 @@ export class ZoneWriter {
         const key = `exclusion${i + 1}`;
         const entityId = resolvePolygon('polygonExclusion', i + 1, 'polygonExclusionEntities', key, polyMap[key]);
         if (entityId) {
-          tasks.push(this.writeClient.setTextEntity(entityId, ''));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, ''),
+            description: `clear exclusion polygon ${i + 1}`,
+            entityId,
+          });
         }
       }
     }
@@ -112,7 +203,11 @@ export class ZoneWriter {
         if (entityId) {
           const textValue = polygonToText(zone.vertices);
           logger.debug({ entityId, vertices: zone.vertices.length }, 'Setting entry polygon');
-          tasks.push(this.writeClient.setTextEntity(entityId, textValue));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, textValue),
+            description: `entry polygon ${idx + 1}`,
+            entityId,
+          });
         }
       });
 
@@ -121,13 +216,18 @@ export class ZoneWriter {
         const key = `entry${i + 1}`;
         const entityId = resolvePolygon('polygonEntry', i + 1, 'polygonEntryEntities', key, polyMap[key]);
         if (entityId) {
-          tasks.push(this.writeClient.setTextEntity(entityId, ''));
+          tasks.push({
+            execute: () => this.writeClient.setTextEntity(entityId, ''),
+            description: `clear entry polygon ${i + 1}`,
+            entityId,
+          });
         }
       }
     }
 
-    logger.info({ taskCount: tasks.length }, 'Executing polygon zone updates');
-    await Promise.all(tasks);
+    logger.info({ taskCount: tasks.length }, 'Executing polygon zone updates sequentially');
+    const failures = await this.executeTasksSequentially(tasks);
+    return { ok: failures.length === 0, failures };
   }
 
   /**
@@ -176,6 +276,8 @@ export class ZoneWriter {
 
   /**
    * Write rectangular zones to device number entities.
+   * Zones are matched by their ID (e.g., "Zone 3" writes to zone3 entities).
+   * Unused zone slots are cleared by setting coordinates to 0.
    * @param zoneMap - Profile entity template map
    * @param zones - Zones to write
    * @param entityNamePrefix - Legacy entity name prefix (for fallback)
@@ -188,8 +290,8 @@ export class ZoneWriter {
     entityNamePrefix: string,
     entityMappings?: EntityMappings,
     deviceId?: string
-  ): Promise<void> {
-    const tasks: Promise<unknown>[] = [];
+  ): Promise<ZoneWriteResult> {
+    const tasks: ZoneWriteTask[] = [];
 
     logger.debug({ entityNamePrefix, deviceId, zoneCount: zones.length, hasMappings: !!entityMappings }, 'Applying rectangular zones');
 
@@ -206,77 +308,141 @@ export class ZoneWriter {
       return EntityResolver.resolveZoneEntitySet(entityMappings, entityNamePrefix, groupKey, key, mapping);
     };
 
-    // Regular zones
+    // Regular zones - write active zones and clear unused slots
     if (zoneMap.zoneConfigEntities || deviceId) {
       const regularMap = zoneMap.zoneConfigEntities || {};
-      regularZones.forEach((zone, idx) => {
-        const key = `zone${idx + 1}`;
+      const maxZones = Math.max(Object.keys(regularMap).length, 4);
+
+      for (let i = 1; i <= maxZones; i++) {
+        const key = `zone${i}`;
         const mapping = regularMap[key];
-        if (!mapping && !deviceId) return;
+        if (!mapping && !deviceId) continue;
 
-        const zoneEntitySet = resolveZone('regular', idx + 1, 'zoneConfigEntities', key, mapping);
-        if (!zoneEntitySet) return;
+        const zoneEntitySet = resolveZone('regular', i, 'zoneConfigEntities', key, mapping);
+        if (!zoneEntitySet) continue;
 
+        // Find zone by its ID index (e.g., "Zone 3" matches slot 3)
+        const zone = regularZones.find(z => this.extractZoneIndex(z.id) === i);
         const updates: Array<{ entity: string; value: number }> = [];
-        if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
-        if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
-        if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
-        if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
-        if (zoneEntitySet.offDelay) updates.push({ entity: zoneEntitySet.offDelay, value: 15 });
+
+        if (zone) {
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+          if (zoneEntitySet.offDelay) updates.push({ entity: zoneEntitySet.offDelay, value: 15 });
+        } else {
+          // Clear unused zone slot by setting all coordinates to 0
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: 0 });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: 0 });
+        }
 
         updates.forEach(({ entity, value }) => {
-          tasks.push(this.writeClient.setNumberEntity(entity, value));
+          tasks.push({
+            execute: () => this.writeClient.setNumberEntity(entity, value),
+            description: `regular zone ${i} ${entity}`,
+            entityId: entity,
+          });
         });
-      });
+      }
     }
 
-    // Exclusion zones
+    // Exclusion zones - write active zones and clear unused slots
     if (zoneMap.exclusionZoneConfigEntities || deviceId) {
       const exclusionMap = zoneMap.exclusionZoneConfigEntities || {};
-      exclusionZones.forEach((zone, idx) => {
-        const key = `exclusion${idx + 1}`;
+      const maxExclusions = Math.max(Object.keys(exclusionMap).length, 2);
+
+      for (let i = 1; i <= maxExclusions; i++) {
+        const key = `exclusion${i}`;
         const mapping = exclusionMap[key];
-        if (!mapping && !deviceId) return;
+        if (!mapping && !deviceId) continue;
 
-        const zoneEntitySet = resolveZone('exclusion', idx + 1, 'exclusionZoneConfigEntities', key, mapping);
-        if (!zoneEntitySet) return;
+        const zoneEntitySet = resolveZone('exclusion', i, 'exclusionZoneConfigEntities', key, mapping);
+        if (!zoneEntitySet) continue;
 
+        // Find zone by its ID index
+        const zone = exclusionZones.find(z => this.extractZoneIndex(z.id) === i);
         const updates: Array<{ entity: string; value: number }> = [];
-        if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
-        if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
-        if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
-        if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+
+        if (zone) {
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+        } else {
+          // Clear unused exclusion zone slot
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: 0 });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: 0 });
+        }
 
         updates.forEach(({ entity, value }) => {
-          tasks.push(this.writeClient.setNumberEntity(entity, value));
+          tasks.push({
+            execute: () => this.writeClient.setNumberEntity(entity, value),
+            description: `exclusion zone ${i} ${entity}`,
+            entityId: entity,
+          });
         });
-      });
+      }
     }
 
-    // Entry zones
+    // Entry zones - write active zones and clear unused slots
     if (zoneMap.entryZoneConfigEntities || deviceId) {
       const entryMap = zoneMap.entryZoneConfigEntities || {};
-      entryZones.forEach((zone, idx) => {
-        const key = `entry${idx + 1}`;
+      const maxEntries = Math.max(Object.keys(entryMap).length, 2);
+
+      for (let i = 1; i <= maxEntries; i++) {
+        const key = `entry${i}`;
         const mapping = entryMap[key];
-        if (!mapping && !deviceId) return;
+        if (!mapping && !deviceId) continue;
 
-        const zoneEntitySet = resolveZone('entry', idx + 1, 'entryZoneConfigEntities', key, mapping);
-        if (!zoneEntitySet) return;
+        const zoneEntitySet = resolveZone('entry', i, 'entryZoneConfigEntities', key, mapping);
+        if (!zoneEntitySet) continue;
 
+        // Find zone by its ID index
+        const zone = entryZones.find(z => this.extractZoneIndex(z.id) === i);
         const updates: Array<{ entity: string; value: number }> = [];
-        if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
-        if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
-        if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
-        if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+
+        if (zone) {
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: zone.x });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: zone.x + zone.width });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: zone.y });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: zone.y + zone.height });
+        } else {
+          // Clear unused entry zone slot
+          if (zoneEntitySet.beginX) updates.push({ entity: zoneEntitySet.beginX, value: 0 });
+          if (zoneEntitySet.endX) updates.push({ entity: zoneEntitySet.endX, value: 0 });
+          if (zoneEntitySet.beginY) updates.push({ entity: zoneEntitySet.beginY, value: 0 });
+          if (zoneEntitySet.endY) updates.push({ entity: zoneEntitySet.endY, value: 0 });
+        }
 
         updates.forEach(({ entity, value }) => {
-          tasks.push(this.writeClient.setNumberEntity(entity, value));
+          tasks.push({
+            execute: () => this.writeClient.setNumberEntity(entity, value),
+            description: `entry zone ${i} ${entity}`,
+            entityId: entity,
+          });
         });
-      });
+      }
     }
 
     logger.info({ taskCount: tasks.length }, 'Executing zone updates');
-    await Promise.all(tasks);
+    const results = await Promise.allSettled(tasks.map((task) => task.execute()));
+    const failures: ZoneWriteFailure[] = [];
+    results.forEach((result, idx) => {
+      if (result.status === 'rejected') {
+        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        failures.push({
+          entityId: tasks[idx].entityId,
+          description: tasks[idx].description,
+          error,
+        });
+      }
+    });
+
+    return { ok: failures.length === 0, failures };
   }
 }
