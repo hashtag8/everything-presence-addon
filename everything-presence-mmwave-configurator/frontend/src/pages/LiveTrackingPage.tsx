@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { DiscoveredDevice, DeviceProfile, RoomConfig, LiveState, ZonePolygon } from '../api/types';
-import { fetchDevices, fetchProfiles, ingressAware } from '../api/client';
+import { fetchDevices, fetchProfiles, fetchSettings, ingressAware } from '../api/client';
 import { fetchRooms, updateRoom } from '../api/rooms';
 import { fetchZonesFromDevice, fetchPolygonModeStatus, fetchPolygonZonesFromDevice, PolygonModeStatus } from '../api/zones';
 import { ZoneCanvas } from '../components/ZoneCanvas';
@@ -44,6 +44,12 @@ interface LiveTrackingPageProps {
   }>;
   onRoomChange?: (roomId: string | null, profileId: string | null) => void;
 }
+
+const normalizeAngle = (angle: number): number => {
+  let normalized = ((angle % 360) + 360) % 360;
+  if (normalized > 180) normalized -= 360;
+  return normalized;
+};
 
 export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   onBack,
@@ -92,6 +98,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     showZones, setShowZones,
     showDeviceIcon, setShowDeviceIcon,
     showDeviceRadar, setShowDeviceRadar,
+    showAlignedDirection, setShowAlignedDirection,
     clipRadarToWalls, setClipRadarToWalls,
     heatmapEnabled, setHeatmapEnabled,
     heatmapHours, setHeatmapHours,
@@ -114,6 +121,15 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   // Check if device supports tracking (EP Lite only for heatmap)
   const supportsHeatmap = selectedProfile?.capabilities &&
     (selectedProfile.capabilities as { tracking?: boolean }).tracking === true && !isEP1;
+
+  const hasLiveStateForRoom = Boolean(
+    liveState && selectedRoom?.deviceId && liveState.deviceId === selectedRoom.deviceId
+  );
+  const showLiveOverlays = isEP1 ? true : hasLiveStateForRoom;
+  const installationAngle =
+    hasLiveStateForRoom && typeof liveState?.config?.installationAngle === 'number'
+      ? liveState.config.installationAngle
+      : 0;
 
   // Device mappings context - used to check if device has valid entity mappings
   // useDeviceMapping triggers loading the mapping into cache, useDeviceMappings provides the check
@@ -155,24 +171,45 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   useEffect(() => {
     const load = async () => {
       try {
-        const [devicesRes, profilesRes, roomsRes] = await Promise.all([
+        const [devicesRes, profilesRes, roomsRes, settingsRes] = await Promise.all([
           fetchDevices(),
           fetchProfiles(),
           fetchRooms(),
+          fetchSettings(),
         ]);
         setDevices(devicesRes.devices);
         setProfiles(profilesRes.profiles);
         setRooms(roomsRes.rooms);
 
-        let roomId = selectedRoomId;
-        let profileId = selectedProfileId;
+        let roomId = selectedRoomId ?? initialRoomId ?? null;
+        const defaultRoomId =
+          typeof settingsRes.settings.defaultRoomId === 'string' ? settingsRes.settings.defaultRoomId : null;
 
+        if (!roomId && defaultRoomId) {
+          const defaultRoom = roomsRes.rooms.find((room) => room.id === defaultRoomId);
+          if (defaultRoom) {
+            roomId = defaultRoomId;
+          }
+        }
         if (!roomId && roomsRes.rooms.length > 0) {
           roomId = roomsRes.rooms[0].id;
-          setSelectedRoomId(roomId);
+        }
+
+        let profileId = selectedProfileId ?? initialProfileId ?? null;
+        if (roomId) {
+          const selected = roomsRes.rooms.find((room) => room.id === roomId);
+          if (selected?.profileId) {
+            profileId = selected.profileId;
+          }
         }
         if (!profileId && profilesRes.profiles.length > 0) {
           profileId = profilesRes.profiles[0].id;
+        }
+
+        if (roomId && roomId !== selectedRoomId) {
+          setSelectedRoomId(roomId);
+        }
+        if (profileId && profileId !== selectedProfileId) {
           setSelectedProfileId(profileId);
         }
 
@@ -191,13 +228,24 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     load();
   }, []);
 
+  useEffect(() => {
+    if (!initialRoomId || initialRoomId === selectedRoomId) return;
+    const room = rooms.find((r) => r.id === initialRoomId);
+    if (!room) return;
+    setSelectedRoomId(initialRoomId);
+    if (room.profileId) {
+      setSelectedProfileId(room.profileId);
+    }
+    onRoomChange?.(initialRoomId, room.profileId ?? selectedProfileId ?? null);
+  }, [initialRoomId, rooms, selectedRoomId, selectedProfileId, onRoomChange]);
+
   // Update trail history when target positions change
   useEffect(() => {
-    if (!showTrails) {
+    if (!showTrails || !showLiveOverlays) {
       return;
     }
 
-    const targets = propTargetPositions ?? [];
+    const targets = showLiveOverlays ? (propTargetPositions ?? []) : [];
     if (targets.length === 0) {
       return;
     }
@@ -232,11 +280,11 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
       return updated;
     });
-  }, [propTargetPositions, showTrails]);
+  }, [propTargetPositions, showTrails, showLiveOverlays]);
 
   // Recording mode - capture permanent trail while recording
   useEffect(() => {
-    if (!isRecording) {
+    if (!isRecording || !showLiveOverlays) {
       return;
     }
 
@@ -271,10 +319,15 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
       return newPoints.length > 0 ? [...prev, ...newPoints] : prev;
     });
-  }, [propTargetPositions, isRecording]);
+  }, [propTargetPositions, isRecording, showLiveOverlays]);
 
   // Smooth tracking animation with requestAnimationFrame
   useEffect(() => {
+    if (!showLiveOverlays) {
+      setAnimatedPositions(new Map());
+      return;
+    }
+
     const targets = propTargetPositions ?? [];
 
     if (!smoothTracking) {
@@ -331,7 +384,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [propTargetPositions, smoothTracking]);
+  }, [propTargetPositions, smoothTracking, showLiveOverlays]);
 
   // Fetch existing zones from device when room is loaded
   // Using refs to prevent re-fetching when entityMappings changes (which happens after zone sync)
@@ -558,6 +611,49 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
     speed: number | null;
     angle: number | null;
   }>;
+  const displayTargetPositions = showLiveOverlays ? targetPositions : [];
+  const presenceAvailability = liveState?.availability?.presence;
+  const mmwaveAvailability = liveState?.availability?.mmwave;
+  const pirAvailability = liveState?.availability?.pir;
+
+  const presenceLabel =
+    presenceAvailability === 'unavailable'
+      ? 'Unavailable'
+      : liveState?.presence
+      ? 'Detected'
+      : 'Not detected';
+  const presenceClass =
+    presenceAvailability === 'unavailable'
+      ? 'text-amber-300'
+      : liveState?.presence
+      ? 'text-emerald-400'
+      : 'text-slate-400';
+
+  const mmwaveLabel =
+    mmwaveAvailability === 'unavailable'
+      ? 'Unavailable'
+      : liveState?.mmwave
+      ? 'Active'
+      : 'Inactive';
+  const mmwaveClass =
+    mmwaveAvailability === 'unavailable'
+      ? 'text-amber-300'
+      : liveState?.mmwave
+      ? 'text-emerald-400'
+      : 'text-slate-400';
+
+  const pirLabel =
+    pirAvailability === 'unavailable'
+      ? 'Unavailable'
+      : liveState?.pir
+      ? 'Active'
+      : 'Inactive';
+  const pirClass =
+    pirAvailability === 'unavailable'
+      ? 'text-amber-300'
+      : liveState?.pir
+      ? 'text-emerald-400'
+      : 'text-slate-400';
 
   return (
     <div className="fixed inset-0 bg-slate-950 overflow-hidden">
@@ -726,6 +822,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             roomShellFillMode={selectedRoom.roomShellFillMode}
             floorMaterial={selectedRoom.floorMaterial}
             devicePlacement={selectedRoom.devicePlacement}
+            installationAngle={installationAngle}
             fieldOfViewDeg={selectedProfile?.limits?.fieldOfViewDegrees}
             maxRangeMeters={selectedProfile?.limits?.maxRangeMeters}
             deviceIconUrl={selectedProfile?.iconUrl}
@@ -736,14 +833,14 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             showWalls={showWalls}
             showFurniture={showFurniture}
             showDoors={showDoors}
-            showZones={showZones}
+            showZones={showZones && showLiveOverlays}
             showDevice={showDeviceIcon}
             renderOverlay={({ toCanvas, roomShellPoints, devicePlacement: devicePlacementFromCanvas, fieldOfViewDeg }) => {
               // Heatmap overlay (renders behind everything else)
               // Pass devicePlacement to transform device-relative coordinates to room coordinates
-              const heatmapOverlay = (
-                <HeatmapOverlay data={heatmapData} visible={heatmapEnabled} toCanvas={toCanvas} devicePlacement={selectedRoom?.devicePlacement} intensityThreshold={heatmapThreshold} roomShellPoints={roomShellPoints} />
-              );
+              const heatmapOverlay = showLiveOverlays ? (
+                <HeatmapOverlay data={heatmapData} visible={heatmapEnabled} toCanvas={toCanvas} devicePlacement={selectedRoom?.devicePlacement} installationAngle={installationAngle} intensityThreshold={heatmapThreshold} roomShellPoints={roomShellPoints} />
+              ) : null;
 
               // Define colors for each target (up to 3 targets)
               const targetColors = [
@@ -816,10 +913,10 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               ) : null;
 
               // Render live target positions (EP Lite with tracking)
-              const targetElements = targetPositions.length > 0 ? (
+              const targetElements = displayTargetPositions.length > 0 ? (
                 <g>
                   {/* Render trails first (so they appear behind targets) */}
-                  {showTrails && targetPositions.map((target) => {
+                  {showTrails && displayTargetPositions.map((target) => {
                     const trail = trailHistory.get(target.id) || [];
                     if (trail.length < 2) return null;
 
@@ -866,7 +963,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                   })}
 
                   {/* Render target markers */}
-                  {targetPositions.map((target) => {
+                  {displayTargetPositions.map((target) => {
                     // Use animated positions if smooth tracking is enabled
                     const animatedPos = animatedPositions.get(target.id);
                     const renderPos = animatedPos || { x: target.x, y: target.y };
@@ -984,8 +1081,6 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               // Render distance arcs for EPL (tracking devices)
               if (selectedProfile?.capabilities?.tracking && !selectedProfile?.capabilities?.distanceOnlyTracking && selectedRoom?.devicePlacement) {
                 const maxDistanceMeters = liveState?.config?.distanceMax;
-                const installationAngle = liveState?.config?.installationAngle ?? 0;
-
                 // EPL configurable max distance (from number.${name}_distance entity)
                 return (
                   <g>
@@ -1016,11 +1111,13 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       />
                     )}
 
-                    {/* Installation Angle Indicator - shows physical sensor direction */}
-                    {installationAngle !== 0 && (() => {
+                    {/* Installation Angle Indicator - shows compensated direction */}
+                    {showAlignedDirection && installationAngle !== 0 && (() => {
                       const devicePos = toCanvas({ x: selectedRoom.devicePlacement.x, y: selectedRoom.devicePlacement.y });
-                      // Device rotation + 90 (so 0° points down/forward) + installation angle offset
-                      const physicalAngleRad = ((selectedRoom.devicePlacement.rotationDeg ?? 0) + 90 + installationAngle) * Math.PI / 180;
+                      const rotationDeg = selectedRoom.devicePlacement.rotationDeg ?? 0;
+                      const effectiveRotationDeg = normalizeAngle(rotationDeg + installationAngle);
+                      // Device rotation + 90 (so 0 deg points down/forward) + installation angle compensation
+                      const physicalAngleRad = (effectiveRotationDeg + 90) * Math.PI / 180;
                       const lineLength = 80; // pixels
                       const endX = devicePos.x + Math.cos(physicalAngleRad) * lineLength;
                       const endY = devicePos.y + Math.sin(physicalAngleRad) * lineLength;
@@ -1036,7 +1133,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
 
                       return (
                         <g style={{ pointerEvents: 'none' }}>
-                          {/* Dashed line showing physical direction */}
+                          {/* Dashed line showing compensated direction */}
                           <line
                             x1={devicePos.x}
                             y1={devicePos.y}
@@ -1061,7 +1158,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                             fill="#f59e0b"
                             fontWeight="600"
                           >
-                            Physical ({installationAngle > 0 ? '+' : ''}{installationAngle}°)
+                            Aligned ({effectiveRotationDeg > 0 ? "+" : ""}{effectiveRotationDeg} deg)
                           </text>
                         </g>
                       );
@@ -1102,7 +1199,13 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
             {/* Main Status Panel */}
             <div className="rounded-xl border border-slate-700/50 bg-slate-900/90 backdrop-blur p-4 text-sm text-slate-200 shadow-xl">
               <div className="flex items-center gap-2 mb-3">
-                <div className={`w-3 h-3 rounded-full ${liveState?.presence ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'}`} />
+                <div className={`w-3 h-3 rounded-full ${
+                  presenceAvailability === 'unavailable'
+                    ? 'bg-amber-500'
+                    : liveState?.presence
+                    ? 'bg-emerald-500 animate-pulse'
+                    : 'bg-slate-600'
+                }`} />
                 <span className="font-semibold text-white">{isEP1 ? 'EP1 Status' : 'Live Tracking'}</span>
               </div>
 
@@ -1110,9 +1213,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               <div className="space-y-2 text-xs">
                 <div className="flex justify-between py-1 border-b border-slate-700/50">
                   <span className="text-slate-400">Presence:</span>
-                  <span className={liveState.presence ? 'text-emerald-400' : 'text-slate-400'}>
-                    {liveState.presence ? 'Detected' : 'Not detected'}
-                  </span>
+                  <span className={presenceClass}>{presenceLabel}</span>
                 </div>
 
                 {liveState.distance !== null && liveState.distance !== undefined && (
@@ -1125,7 +1226,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 {!isEP1 && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">Targets:</span>
-                    <span className="text-aqua-400">{targetPositions.length}</span>
+                    <span className="text-aqua-400">{displayTargetPositions.length}</span>
                   </div>
                 )}
 
@@ -1138,7 +1239,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                   </div>
                 )}
 
-                {!isEP1 && liveState.config?.installationAngle !== undefined && liveState.config.installationAngle !== 0 && (
+                {!isEP1 && hasLiveStateForRoom && liveState.config?.installationAngle !== undefined && liveState.config.installationAngle !== 0 && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">Install Angle:</span>
                     <span className="text-amber-400">{liveState.config.installationAngle}°</span>
@@ -1157,21 +1258,17 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                   </div>
                 )}
 
-                {isEP1 && liveState.mmwave !== undefined && (
+                {isEP1 && (liveState.mmwave !== undefined || mmwaveAvailability === 'unavailable') && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">mmWave:</span>
-                    <span className={liveState.mmwave ? 'text-emerald-400' : 'text-slate-400'}>
-                      {liveState.mmwave ? 'Active' : 'Inactive'}
-                    </span>
+                    <span className={mmwaveClass}>{mmwaveLabel}</span>
                   </div>
                 )}
 
-                {liveState.pir !== undefined && (
+                {(liveState.pir !== undefined || pirAvailability === 'unavailable') && (
                   <div className="flex justify-between py-1 border-b border-slate-700/50">
                     <span className="text-slate-400">PIR:</span>
-                    <span className={liveState.pir ? 'text-emerald-400' : 'text-slate-400'}>
-                      {liveState.pir ? 'Active' : 'Inactive'}
-                    </span>
+                    <span className={pirClass}>{pirLabel}</span>
                   </div>
                 )}
 
@@ -1625,6 +1722,22 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                       Device Max ({String(selectedProfile?.limits?.maxRangeMeters ?? 25)}m)
                     </span>
                   </label>
+
+                  {/* Aligned direction - EPL only */}
+                  {!isEP1 && (
+                    <label className="flex items-center gap-2 cursor-pointer text-sm text-slate-200 hover:text-white transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={showAlignedDirection}
+                        onChange={(e) => setShowAlignedDirection(e.target.checked)}
+                        className="w-4 h-4 rounded border-slate-600 bg-slate-800 text-amber-500 focus:ring-amber-500 focus:ring-offset-0"
+                      />
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-3 rounded-full bg-amber-500"></span>
+                        Aligned Direction
+                      </span>
+                    </label>
+                  )}
 
                   {/* Movement Trails - EPL only */}
                   {!isEP1 && (
