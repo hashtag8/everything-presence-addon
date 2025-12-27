@@ -8,7 +8,21 @@ export interface DiscoveredDevice {
   model?: string;
   entityNamePrefix?: string; // e.g., "bedroom_ep_lite" from "binary_sensor.bedroom_ep_lite_occupancy"
   firmwareVersion?: string; // Software/firmware version from device registry (e.g., "1.3.2")
+  areaName?: string; // Home Assistant area name (e.g., "Living Room")
 }
+
+const normalizeManufacturer = (value: unknown): string => {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  if (Array.isArray(value)) {
+    return value.map(item => String(item ?? '')).join(', ').trim();
+  }
+  if (value == null) {
+    return '';
+  }
+  return String(value).trim();
+};
 
 export class DeviceDiscoveryService {
   private readonly readTransport: IHaReadTransport;
@@ -146,32 +160,52 @@ export class DeviceDiscoveryService {
   }
 
   async discover(): Promise<DiscoveredDevice[]> {
-    const devices = await this.readTransport.listDevices();
+    // Fetch devices and areas in parallel
+    const [devices, areas] = await Promise.all([
+      this.readTransport.listDevices(),
+      this.readTransport.listAreaRegistry().catch((err) => {
+        logger.warn({ err }, 'Failed to fetch area registry, continuing without area info');
+        return [];
+      }),
+    ]);
 
     if (!Array.isArray(devices)) {
       logger.warn('Unexpected devices payload from HA');
       return [];
     }
 
+    // Build area_id -> name map for quick lookup
+    const areaMap = new Map<string, string>();
+    for (const area of areas) {
+      if (area.area_id && area.name) {
+        areaMap.set(area.area_id, area.name);
+      }
+    }
+
     const filteredDevices = devices
       .map((d: any) => ({
         id: d.id as string,
         name: (d.name_by_user as string) || (d.name as string) || 'Unnamed device',
-        manufacturer: (d.manufacturer as string | undefined)?.trim(),
+        manufacturer: normalizeManufacturer(d.manufacturer) || undefined,
         model: d.model as string | undefined,
         firmwareVersion: d.sw_version as string | undefined,
+        areaId: d.area_id as string | undefined,
       }))
       .filter((d) => {
-        const manufacturer = (d.manufacturer ?? '').toLowerCase();
+        const manufacturer = normalizeManufacturer(d.manufacturer).toLowerCase();
         return this.manufacturerFilters.some(filter => manufacturer === filter.toLowerCase());
       });
 
-    // Enrich with entity name prefix
+    // Enrich with entity name prefix and area name
     const enrichedDevices = await Promise.all(
-      filteredDevices.map(async (device) => ({
-        ...device,
-        entityNamePrefix: await this.getEntityNamePrefixForDevice(device.id),
-      }))
+      filteredDevices.map(async (device) => {
+        const { areaId, ...rest } = device;
+        return {
+          ...rest,
+          entityNamePrefix: await this.getEntityNamePrefixForDevice(device.id),
+          areaName: areaId ? areaMap.get(areaId) : undefined,
+        };
+      })
     );
 
     return enrichedDevices;
