@@ -24,13 +24,43 @@ A visual configuration tool for Everything Presence devices in Home Assistant.
 
 ### Installation
 
-1. Add this repository to your Home Assistant Add-on Store:
-   ```
-   https://github.com/EverythingSmartHome/everything-presence-addons
-   ```
-2. Install "Everything Presence Zone Configurator" from the add-on store
-3. Start the add-on and open the web UI
+1. [Click this link to add this repository to the Add-on Store](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/EverythingSmartHome/everything-presence-addons) (note: not HACS) and click Add.
+   - If that link doesn't work, then
+        1. Go to http://homeassistant.local:8123/hassio/store (or whatever your Home Assistant URL is)
+        2. Click the 3 dots icon in the upper right, then click `Repository`
+        3. In the Add field, paste `https://github.com/EverythingSmartHome/everything-presence-addons` 
+        4. Click `+ Add` then `Close`
+3. Scroll to the section "Everything Presence Add-ons" 
+4. Click "Everything Presence Zone Configurator" and then Install
+5. Start the add-on and open the web UI
+
+### Standalone Docker
+
+Use the standalone image for non-Home Assistant installs:
+
+```
+everythingsmarthome/everything-presence-mmwave-configurator:latest
+```
+
+Set `HA_BASE_URL` and `HA_LONG_LIVED_TOKEN` for standalone mode. The `:addon` tag is the Home Assistant add-on base image and requires Supervisor to run.
+
+Example `docker-compose.yaml`:
+
+```yaml
+services:
+  zone-configurator:
+    image: everythingsmarthome/everything-presence-mmwave-configurator:latest
+    container_name: everything-presence-mmwave-configurator
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      HA_BASE_URL: "http://homeassistant.local:8123"
+      HA_LONG_LIVED_TOKEN: "REPLACE_WITH_LONG_LIVED_TOKEN"
+    volumes:
+      - ./config:/config
+```
 
 ### Documentation
 
-For more information about Everything Presence devices, visit [Everything Smart Home](https://everythingsmarthome.co.uk)
+For more information about Everything Presence devices, visit [Everything Smart Home](https://docs.everythingsmart.io)
