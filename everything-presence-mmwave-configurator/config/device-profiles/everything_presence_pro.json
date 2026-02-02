@@ -1,6 +1,6 @@
 {
   "id": "everything_presence_pro",
-  "schemaVersion": "1.0",
+  "schemaVersion": "1.2",
   "label": "Everything Presence Pro",
   "model": "Everything Presence Pro",
   "manufacturer": "EverythingSmartTechnology",
@@ -10,7 +10,7 @@
     "zones": true,
     "exclusionZones": true,
     "entryZones": false,
-    "polygonZones": false,
+    "polygonZones": true,
     "distanceOnlyTracking": false,
     "sensors": {
       "mmwavePresence": true,
@@ -27,6 +27,16 @@
     "maxRangeMeters": 6,
     "fieldOfViewDegrees": 120
   },
+  "services": {
+    "getBuildFlags": {
+      "domain": "esphome",
+      "template": "${name}_get_build_flags"
+    },
+    "setUpdateManifest": {
+      "domain": "esphome",
+      "template": "${name}_set_update_manifest"
+    }
+  },
   "entities": {
     "presence": {
       "template": "binary_sensor.${name}_occupancy",
@@ -40,6 +50,13 @@
       "category": "sensor",
       "subcategory": "environment",
       "label": "CO2",
+      "required": false
+    },
+    "firmwareUpdate": {
+      "template": "update.${name}_firmware_update",
+      "category": "sensor",
+      "subcategory": "firmware",
+      "label": "Firmware Update",
       "required": false
     },
     "maxDistance": {
@@ -124,6 +141,48 @@
       "max": 60,
       "step": 1,
       "unit": "s",
+      "required": false
+    },
+    "polygonZone1": {
+      "template": "text.${name}_polygon_zone_1",
+      "category": "zone",
+      "zoneType": "polygon",
+      "zoneIndex": 1,
+      "required": false
+    },
+    "polygonZone2": {
+      "template": "text.${name}_polygon_zone_2",
+      "category": "zone",
+      "zoneType": "polygon",
+      "zoneIndex": 2,
+      "required": false
+    },
+    "polygonZone3": {
+      "template": "text.${name}_polygon_zone_3",
+      "category": "zone",
+      "zoneType": "polygon",
+      "zoneIndex": 3,
+      "required": false
+    },
+    "polygonZone4": {
+      "template": "text.${name}_polygon_zone_4",
+      "category": "zone",
+      "zoneType": "polygon",
+      "zoneIndex": 4,
+      "required": false
+    },
+    "polygonExclusion1": {
+      "template": "text.${name}_polygon_exclusion_1",
+      "category": "zone",
+      "zoneType": "polygonExclusion",
+      "zoneIndex": 1,
+      "required": false
+    },
+    "polygonExclusion2": {
+      "template": "text.${name}_polygon_exclusion_2",
+      "category": "zone",
+      "zoneType": "polygonExclusion",
+      "zoneIndex": 2,
       "required": false
     },
     "zone1OffDelay": {
@@ -580,6 +639,36 @@
       "zoneType": "regular",
       "zoneIndex": 4,
       "required": false
+    },
+    "firmwareBle": {
+      "template": "select.${name}_bluetooth_proxy",
+      "category": "setting",
+      "group": "Firmware Info",
+      "label": "Bluetooth Proxy",
+      "controlType": "select",
+      "options": ["Disabled", "Enabled"],
+      "description": "Indicates if Bluetooth proxy is enabled in firmware build",
+      "required": false
+    },
+    "firmwareCo2": {
+      "template": "select.${name}_co2_sensor",
+      "category": "setting",
+      "group": "Firmware Info",
+      "label": "CO2 Sensor",
+      "controlType": "select",
+      "options": ["Disabled", "Enabled"],
+      "description": "Indicates if CO2 sensor is enabled in firmware build",
+      "required": false
+    },
+    "firmwareNetwork": {
+      "template": "select.${name}_network_type",
+      "category": "setting",
+      "group": "Firmware Info",
+      "label": "Network Type",
+      "controlType": "select",
+      "options": ["WiFi", "Ethernet"],
+      "description": "Indicates network type configured in firmware build",
+      "required": false
     }
   },
   "entityMap": {
@@ -588,8 +677,16 @@
     "maxDistanceEntity": "number.${name}_tracking_detection_range",
     "installationAngleEntity": "number.${name}_tracking_sensor_angle",
     "polygonZonesEnabledEntity": null,
-    "polygonZoneEntities": null,
-    "polygonExclusionEntities": null,
+    "polygonZoneEntities": {
+      "zone1": "text.${name}_polygon_zone_1",
+      "zone2": "text.${name}_polygon_zone_2",
+      "zone3": "text.${name}_polygon_zone_3",
+      "zone4": "text.${name}_polygon_zone_4"
+    },
+    "polygonExclusionEntities": {
+      "exclusion1": "text.${name}_polygon_exclusion_1",
+      "exclusion2": "text.${name}_polygon_exclusion_2"
+    },
     "polygonEntryEntities": null,
     "zoneConfigEntities": {
       "zone1": {
