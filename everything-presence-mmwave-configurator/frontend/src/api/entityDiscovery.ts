@@ -16,8 +16,9 @@ export interface EntityRegistryEntry {
 
 /**
  * Confidence level for entity matching.
+ * 'conflict' means multiple candidates scored equally and needs review.
  */
-export type MatchConfidence = 'exact' | 'suffix' | 'name' | 'none';
+export type MatchConfidence = 'exact' | 'suffix' | 'name' | 'conflict' | 'none';
 
 /**
  * Result of matching a single entity template.
@@ -44,6 +45,8 @@ export interface DiscoveryResult {
   results: EntityMatchResult[];
   suggestedMappings: Partial<EntityMappings>;
   deviceEntities: EntityRegistryEntry[];
+  /** Auto-discovered ESPHome services (if any), e.g. getBuildFlags */
+  serviceMappings?: Record<string, string>;
 }
 
 /**
@@ -185,23 +188,23 @@ export const groupMatchResultsByCategory = (
       groups['Environmental Sensors'].push(result);
     } else if (key.includes('distance') || key.includes('speed') || key.includes('energy') || key.includes('targetCount')) {
       groups['Distance/Tracking'].push(result);
-    } else if (key.includes('zoneConfigEntities.zone1')) {
-      groups['Zone 1'].push(result);
-    } else if (key.includes('zoneConfigEntities.zone2')) {
-      groups['Zone 2'].push(result);
-    } else if (key.includes('zoneConfigEntities.zone3')) {
-      groups['Zone 3'].push(result);
-    } else if (key.includes('zoneConfigEntities.zone4')) {
-      groups['Zone 4'].push(result);
     } else if (key.includes('exclusion')) {
       groups['Exclusion Zones'].push(result);
     } else if (key.includes('entry')) {
       groups['Entry Zones'].push(result);
+    } else if (key.startsWith('zone1') || key.includes('zoneConfigEntities.zone1')) {
+      groups['Zone 1'].push(result);
+    } else if (key.startsWith('zone2') || key.includes('zoneConfigEntities.zone2')) {
+      groups['Zone 2'].push(result);
+    } else if (key.startsWith('zone3') || key.includes('zoneConfigEntities.zone3')) {
+      groups['Zone 3'].push(result);
+    } else if (key.startsWith('zone4') || key.includes('zoneConfigEntities.zone4')) {
+      groups['Zone 4'].push(result);
     } else if (key.includes('polygon')) {
       groups['Polygon Zones'].push(result);
     } else if (key.includes('trackingTargets')) {
       groups['Tracking Targets'].push(result);
-    } else if (key.includes('max') || key.includes('installation') || key.includes('mode') || key.includes('Enabled')) {
+    } else if (key.includes('max') || key.includes('installation') || key.includes('mode') || key.includes('Enabled') || key.includes('firmwareUpdate')) {
       groups['Configuration'].push(result);
     } else {
       groups['Other'].push(result);
@@ -243,6 +246,7 @@ export const getTemplateKeyLabel = (templateKey: string): string => {
     installationAngleEntity: 'Installation Angle',
     polygonZonesEnabledEntity: 'Polygon Zones Switch',
     trackingTargetCountEntity: 'Tracking Target Count',
+    firmwareUpdateEntity: 'Firmware Update',
     beginX: 'Begin X',
     endX: 'End X',
     beginY: 'Begin Y',
