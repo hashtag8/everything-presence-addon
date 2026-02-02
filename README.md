@@ -44,6 +44,8 @@ everythingsmarthome/everything-presence-mmwave-configurator:latest
 
 Set `HA_BASE_URL` and `HA_LONG_LIVED_TOKEN` for standalone mode. The `:addon` tag is the Home Assistant add-on base image and requires Supervisor to run.
 
+**Port change (v2.0.11):** The default app port is now `42069`. Existing Docker users can either update their port mapping to `42069:42069` or keep the old behavior by setting `PORT=3000` and continuing to map `3000:3000`.
+
 Example `docker-compose.yaml`:
 
 ```yaml
@@ -53,13 +55,22 @@ services:
     container_name: everything-presence-mmwave-configurator
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "42069:42069"
+      - "38080:38080"
     environment:
       HA_BASE_URL: "http://homeassistant.local:8123"
       HA_LONG_LIVED_TOKEN: "REPLACE_WITH_LONG_LIVED_TOKEN"
+      FIRMWARE_LAN_PORT: "38080"
     volumes:
       - ./config:/config
 ```
+
+### LAN Firmware Port
+
+Firmware updates are served over a local HTTP port for ESP devices. By default this uses port `38080`.
+
+- Home Assistant add-on: configure `firmware_lan_port` in the add-on Configuration tab.
+- Standalone Docker: set `FIRMWARE_LAN_PORT` and map the same host port.
 
 ### Documentation
 
